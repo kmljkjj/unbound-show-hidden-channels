@@ -1,107 +1,133 @@
 /**
- * ShowHiddenChannels — Unbound
+ * ShowHiddenChannels for Unbound (v1.1.0)
  *
- * Affiche dans la liste des salons ceux auxquels tu n'as pas accès
- * (restriction de rôle). Tu vois le nom, le topic et quelques métadonnées.
- * Tu ne peux PAS lire les messages : Discord ne les envoie jamais au client.
+ * Based on working mobile implementations:
+ * - Lioncat6/revenge-plugins (hidden-channels)
+ * - c10udburst vendetta hidden-channels
+ * - yofukashino tharkidetta ShowHiddenChannels
  *
- * Inspiré des plugins Vendetta/Bunny (c10udburst, yofukashino) et Vencord.
- * Best-effort : les modules Discord bougent souvent après une update.
+ * Core idea: patch PermissionStore.can so VIEW_CHANNEL always returns true
+ * for the channel list, while keeping a realCheck flag for isHidden().
+ * Then force ChannelListStore / PermissionStore to rebuild.
+ *
+ * You still cannot read messages — Discord never sends them.
  */
 
-const { metro, patcher, utils } = require('@unbound-app/api');
+const api =
+  (typeof unbound !== 'undefined' && unbound) ||
+  (typeof require === 'function' ? require('@unbound-app/api') : null);
 
-const Patcher = patcher.createPatcher('show-hidden-channels');
+if (!api) {
+  console.error('[ShowHiddenChannels] Unbound API not found');
+}
 
-// Channel types to never treat as "hidden guild channels"
-const SKIP_TYPES = new Set([
-  1, // DM
-  3, // GROUP_DM
-  4, // GUILD_CATEGORY
-]);
+const metro = api && api.metro;
+const patcher = api && api.patcher;
+const Patcher = patcher ? patcher.createPatcher('show-hidden-channels') : null;
 
-function safeFind(...propsList) {
-  for (const props of propsList) {
-    try {
-      const mod = metro.findByProps(...props);
-      if (mod) return mod;
-    } catch (_) {}
-  }
+function findPermissions() {
+  try {
+    const store = metro.findStore && metro.findStore('Permission');
+    if (store && typeof store.can === 'function') return store;
+  } catch (_) {}
+
+  try {
+    const m = metro.findByProps('getChannelPermissions', 'can');
+    if (m && typeof m.can === 'function') return m;
+  } catch (_) {}
+
+  try {
+    const m = metro.findByProps('can', 'canWithPartialContext');
+    if (m && typeof m.can === 'function') return m;
+  } catch (_) {}
+
+  try {
+    const m = metro.findByProps('can');
+    if (m && typeof m.can === 'function') return m;
+  } catch (_) {}
+
   return null;
 }
 
-function safeFindName(name) {
+function findChannelStore() {
   try {
-    if (typeof metro.findByName === 'function') {
-      return metro.findByName(name);
-    }
+    const s = metro.findStore && metro.findStore('Channel');
+    if (s && typeof s.getChannel === 'function') return s;
+  } catch (_) {}
+  try {
+    return metro.findByProps('getChannel', 'getMutableGuildChannelsForGuild');
+  } catch (_) {}
+  try {
+    return metro.findByProps('getChannel');
   } catch (_) {}
   return null;
 }
 
-function resolvePermissions() {
-  return (
-    safeFind(['getChannelPermissions', 'can']) ||
-    safeFind(['can', 'getGuildPermissions']) ||
-    safeFind(['can'])
-  );
-}
+function findViewChannelPermission() {
+  try {
+    if (metro.common && metro.common.Constants && metro.common.Constants.Permissions) {
+      return metro.common.Constants.Permissions.VIEW_CHANNEL;
+    }
+  } catch (_) {}
 
-function resolveChannelStore() {
-  return (
-    safeFind(['getChannel', 'getMutableGuildChannelsForGuild']) ||
-    safeFind(['getChannel', 'getDMFromUserId']) ||
-    safeFind(['getChannel'])
-  );
-}
+  try {
+    const c = metro.findByProps('Permissions', 'ChannelTypes');
+    if (c && c.Permissions && c.Permissions.VIEW_CHANNEL != null) {
+      return c.Permissions.VIEW_CHANNEL;
+    }
+  } catch (_) {}
 
-function resolveConstants() {
-  // VIEW_CHANNEL is typically a bigint permission flag
-  const perms =
-    safeFind(['VIEW_CHANNEL', 'SEND_MESSAGES']) ||
-    safeFind(['Permissions']) ||
-    null;
-  if (!perms) return null;
-  if (perms.VIEW_CHANNEL != null) return perms;
-  if (perms.Permissions && perms.Permissions.VIEW_CHANNEL != null) {
-    return perms.Permissions;
+  try {
+    const c = metro.findByProps('VIEW_CHANNEL', 'SEND_MESSAGES');
+    if (c && c.VIEW_CHANNEL != null) return c.VIEW_CHANNEL;
+  } catch (_) {}
+
+  try {
+    return BigInt(1024);
+  } catch (_) {
+    return 1024;
   }
-  return perms;
+}
+
+function findChannelTypes() {
+  try {
+    if (metro.common && metro.common.Constants && metro.common.Constants.ChannelTypes) {
+      return metro.common.Constants.ChannelTypes;
+    }
+  } catch (_) {}
+  try {
+    const c = metro.findByProps('ChannelTypes');
+    return c && c.ChannelTypes;
+  } catch (_) {}
+  return { DM: 1, GROUP_DM: 3, GUILD_CATEGORY: 4 };
 }
 
 function getChannel(idOrChannel) {
   if (!idOrChannel) return null;
   if (typeof idOrChannel === 'object' && idOrChannel.id) return idOrChannel;
-  const store = resolveChannelStore();
-  if (!store || typeof store.getChannel !== 'function') return null;
+  const ChannelStore = findChannelStore();
+  if (!ChannelStore || typeof ChannelStore.getChannel !== 'function') return null;
   try {
-    return store.getChannel(idOrChannel);
+    return ChannelStore.getChannel(idOrChannel);
   } catch (_) {
     return null;
   }
 }
 
-/**
- * Real permission check (bypasses our own patch via channel.realCheck).
- */
-function isHiddenChannel(channelOrId) {
+function isHidden(channelOrId) {
   try {
     let channel = getChannel(channelOrId);
     if (!channel) return false;
-    if (SKIP_TYPES.has(channel.type)) return false;
-    // DMs / group DMs
-    if (channel.isDM && channel.isDM()) return false;
-    if (channel.isGroupDM && channel.isGroupDM()) return false;
 
-    const Permissions = resolvePermissions();
-    const Constants = resolveConstants();
-    if (!Permissions || typeof Permissions.can !== 'function') return false;
+    const types = findChannelTypes();
+    const skip = [types.DM, types.GROUP_DM, types.GUILD_CATEGORY];
+    if (skip.includes(channel.type)) return false;
 
-    const VIEW =
-      (Constants && Constants.VIEW_CHANNEL) ||
-      (Permissions.VIEW_CHANNEL);
-
-    if (VIEW == null) return false;
+    const Permissions = findPermissions();
+    const VIEW = findViewChannelPermission();
+    if (!Permissions || typeof Permissions.can !== 'function' || VIEW == null) {
+      return false;
+    }
 
     channel.realCheck = true;
     let hidden = false;
@@ -116,131 +142,152 @@ function isHiddenChannel(channelOrId) {
     }
     return hidden;
   } catch (e) {
+    console.warn('[ShowHiddenChannels] isHidden error', e);
     return false;
   }
 }
 
-function patchPermissions() {
-  const Permissions = resolvePermissions();
-  if (!Permissions || typeof Permissions.can !== 'function') {
-    console.warn('[ShowHiddenChannels] Permissions.can not found');
+function forceChannelListRefresh() {
+  try {
+    const Dispatcher =
+      (metro.common && metro.common.Dispatcher) ||
+      metro.findByProps('_currentDispatchActionType', '_processingWaitQueue') ||
+      metro.findByProps('dispatch', 'subscribe');
+
+    if (!Dispatcher) return;
+
+    const nodes =
+      Dispatcher._actionHandlers &&
+      Dispatcher._actionHandlers._dependencyGraph &&
+      Dispatcher._actionHandlers._dependencyGraph.nodes
+        ? Object.values(Dispatcher._actionHandlers._dependencyGraph.nodes)
+        : [];
+
+    for (const node of nodes) {
+      try {
+        if (node && node.name === 'PermissionStore') {
+          const h =
+            node.actionHandler &&
+            (node.actionHandler.CONNECTION_OPEN ||
+              node.actionHandler.handleConnectionOpen ||
+              node.actionHandler.OVERLAY_INITIALIZE);
+          if (typeof h === 'function') h({});
+        }
+        if (node && node.name === 'ChannelListStore') {
+          const h =
+            node.actionHandler &&
+            (node.actionHandler.CONNECTION_OPEN ||
+              node.actionHandler.handleReset ||
+              node.actionHandler.OVERLAY_INITIALIZE);
+          if (typeof h === 'function') h({});
+        }
+      } catch (_) {}
+    }
+  } catch (e) {
+    console.warn('[ShowHiddenChannels] refresh failed', e);
+  }
+}
+
+function start() {
+  if (!metro || !Patcher) {
+    console.error('[ShowHiddenChannels] metro/patcher missing — abort');
     return;
   }
 
-  const Constants = resolveConstants();
-  const VIEW =
-    (Constants && Constants.VIEW_CHANNEL) || Permissions.VIEW_CHANNEL;
+  const Permissions = findPermissions();
+  const VIEW = findViewChannelPermission();
+
+  if (!Permissions || typeof Permissions.can !== 'function') {
+    console.error(
+      '[ShowHiddenChannels] PermissionStore.can NOT FOUND — plugin cannot work on this Discord build'
+    );
+    return;
+  }
+
+  if (VIEW == null) {
+    console.error('[ShowHiddenChannels] VIEW_CHANNEL constant not found');
+    return;
+  }
+
+  console.log('[ShowHiddenChannels] patching Permissions.can, VIEW_CHANNEL=', String(VIEW));
 
   Patcher.after(Permissions, 'can', ({ args, result }) => {
     try {
-      const [permID, channel] = args;
-      // Only rewrite VIEW_CHANNEL checks that are not our internal realCheck
-      if (channel && !channel.realCheck && VIEW != null && permID === VIEW) {
-        return true;
-      }
+      const permID = args[0];
+      const channel = args[1];
+      if (!channel || channel.realCheck) return result;
+
+      const isView =
+        permID === VIEW ||
+        String(permID) === String(VIEW);
+
+      if (isView) return true;
     } catch (_) {}
     return result;
   });
-}
 
-function patchFetchMessages() {
-  // Prevent 403 spam when Discord tries to load messages for a hidden channel
-  const Fetcher =
-    safeFind(['fetchMessages', 'sendMessage']) ||
-    safeFind(['fetchMessages']) ||
-    safeFind(['stores', 'fetchMessages']);
+  try {
+    const MessageActions =
+      metro.findByProps('jumpToMessage', '_sendMessage') ||
+      metro.findByProps('fetchMessages', 'sendMessage') ||
+      metro.findByProps('fetchMessages');
 
-  if (!Fetcher || typeof Fetcher.fetchMessages !== 'function') {
-    console.warn('[ShowHiddenChannels] fetchMessages not found');
-    return;
+    if (MessageActions && typeof MessageActions.fetchMessages === 'function') {
+      Patcher.instead(MessageActions, 'fetchMessages', ({ args, original }) => {
+        try {
+          const payload = args[0];
+          const id =
+            (payload && (payload.channelId || payload.id)) || payload;
+          if (isHidden(id)) return;
+        } catch (_) {}
+        return original(...args);
+      });
+    }
+  } catch (e) {
+    console.warn('[ShowHiddenChannels] fetchMessages patch skipped', e);
   }
 
-  Patcher.instead(Fetcher, 'fetchMessages', ({ args, original }) => {
-    try {
-      const channelArg = args[0];
-      const id =
-        typeof channelArg === 'object'
-          ? channelArg?.channelId || channelArg?.id || channelArg
-          : channelArg;
-      if (isHiddenChannel(id)) return undefined;
-    } catch (_) {}
-    return original.apply(Fetcher, args);
-  });
-}
+  try {
+    const Router =
+      metro.findByProps('transitionToGuild') ||
+      metro.findByProps('transitionToChannel');
 
-function patchNavigation() {
-  // Soft-block switching into a hidden channel (still show it in the list)
-  const Router =
-    safeFind(['transitionToGuild']) ||
-    safeFind(['transitionTo', 'transitionToGuild']) ||
-    safeFind(['selectChannel']);
-
-  if (Router && typeof Router.transitionToGuild === 'function') {
-    Patcher.instead(Router, 'transitionToGuild', ({ args, original }) => {
-      try {
-        // common signature: (guildId, channelId) or similar
-        const channelId = args[1] ?? args[0];
-        if (isHiddenChannel(channelId)) {
-          console.log('[ShowHiddenChannels] blocked navigation to hidden channel');
-          return undefined;
-        }
-      } catch (_) {}
-      return original.apply(Router, args);
-    });
-  }
-
-  if (Router && typeof Router.selectChannel === 'function') {
-    Patcher.instead(Router, 'selectChannel', ({ args, original }) => {
-      try {
-        const channelId = args[0]?.channelId || args[0];
-        if (isHiddenChannel(channelId)) return undefined;
-      } catch (_) {}
-      return original.apply(Router, args);
-    });
-  }
-}
-
-function patchMessagesUI() {
-  // When the messages view opens on a hidden channel, avoid broken UI.
-  // Prefer replacing with a simple no-op if we can find the connected wrapper.
-  const MessagesConnected =
-    safeFindName('MessagesWrapperConnected') ||
-    safeFind(['MessagesWrapperConnected']) ||
-    null;
-
-  if (!MessagesConnected) return;
-
-  // Some builds export the component as default, others as the module itself
-  const target =
-    typeof MessagesConnected.default === 'function'
-      ? MessagesConnected
-      : MessagesConnected;
-
-  const key = typeof target.default === 'function' ? 'default' : null;
-  if (!key) return;
-
-  Patcher.instead(target, key, ({ args, original }) => {
-    try {
-      const channel = args[0]?.channel || args[0]?.channelId;
-      if (isHiddenChannel(channel)) {
-        // Return null / empty — list still shows the channel; chat area stays empty
-        return null;
+    if (Router) {
+      for (const key of Object.keys(Router)) {
+        if (typeof Router[key] !== 'function') continue;
+        Patcher.instead(Router, key, ({ args, original }) => {
+          try {
+            if (typeof args[0] === 'string') {
+              const m = args[0].match(/(\d+)$/);
+              if (m && m[1] && isHidden(m[1])) {
+                console.log('[ShowHiddenChannels] blocked open of hidden channel', m[1]);
+                return {};
+              }
+            }
+            if (args[1] && isHidden(args[1])) return {};
+          } catch (_) {}
+          return original(...args);
+        });
       }
-    } catch (_) {}
-    return original.apply(target, args);
-  });
+    }
+  } catch (e) {
+    console.warn('[ShowHiddenChannels] router patch skipped', e);
+  }
+
+  try {
+    forceChannelListRefresh();
+  } catch (_) {}
+
+  console.log('[ShowHiddenChannels] started OK');
 }
 
-module.exports = {
-  start() {
-    patchPermissions();
-    patchFetchMessages();
-    patchNavigation();
-    patchMessagesUI();
-    console.log('[ShowHiddenChannels] started');
-  },
-  stop() {
-    Patcher.unpatchAll();
-    console.log('[ShowHiddenChannels] stopped');
-  },
-};
+function stop() {
+  if (Patcher) Patcher.unpatchAll();
+  try {
+    forceChannelListRefresh();
+  } catch (_) {}
+  console.log('[ShowHiddenChannels] stopped');
+}
+
+module.exports = { start, stop };
+module.exports.default = module.exports;
