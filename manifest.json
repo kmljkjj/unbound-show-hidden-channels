@@ -3,6 +3,6 @@
   "name": "ShowHiddenChannels",
   "description": "Affiche les salons cachés (noms, topics, infos). Ne permet PAS de lire les messages — impossible côté Discord.",
   "authors": [{ "name": "kmljkjj", "id": "0" }],
-  "version": "1.0.0",
+  "version": "1.1.0",
   "main": "index.js"
 }
