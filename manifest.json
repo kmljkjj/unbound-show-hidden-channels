@@ -1,8 +1,13 @@
 {
-  "id": "show-hidden-channels",
-  "name": "ShowHiddenChannels",
-  "description": "Affiche les salons caches (noms, topics). Toast au demarrage pour verifier que le plugin tourne.",
-  "authors": [{ "name": "kmljkjj", "id": "0" }],
-  "version": "1.3.0",
-  "main": "index.js"
+	"id": "show-hidden-channels",
+	"name": "ShowHiddenChannels",
+	"description": "Affiche dans la liste des salons ceux auxquels tu n'as pas acces (restriction de role). Lecture des messages impossible.",
+	"authors": [
+		{
+			"name": "kmljkjj",
+			"id": "0"
+		}
+	],
+	"version": "1.4.0",
+	"main": "index.js"
 }
