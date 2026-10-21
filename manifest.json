@@ -1,8 +1,8 @@
 {
   "id": "show-hidden-channels",
   "name": "ShowHiddenChannels",
-  "description": "Affiche les salons cachés (noms, topics, infos). Ne permet PAS de lire les messages — impossible côté Discord.",
+  "description": "Affiche les salons caches (noms, topics). Toast au demarrage pour verifier que le plugin tourne.",
   "authors": [{ "name": "kmljkjj", "id": "0" }],
-  "version": "1.2.0",
+  "version": "1.3.0",
   "main": "index.js"
 }
