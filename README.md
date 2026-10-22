@@ -14,7 +14,7 @@ Au demarrage, un toast affiche : Actif v1.6.0 - N patches
 
 - 11 patches : tout est operationnel.
 - (manque: ...) : module CRITIQUE introuvable (can, canWithPartialContext, dispatch). Transmettre le toast exact pour adaptation.
-- Les modules optionnels absents (messages, vocal, non-lus...) n'alentent pas le toast : voir dump().optionalMissing.
+- Les modules optionnels absents (messages, vocal, non-lus...) n'alertent pas dans le toast : voir dump().optionalMissing.
 
 ## Reglages (console Unbound : unbound.__showHiddenChannels)
 
