@@ -1,27 +1,37 @@
 (function () {
 	'use strict';
 
-	// ShowHiddenChannels - port Unbound v1.5.0
+	// ShowHiddenChannels - port Unbound v1.6.0
 	// IMPORTANT : ce fichier doit rester UNE seule expression qui retourne l'objet
 	// du plugin. Unbound evalue les bundles avec eval('(() => { return ' + bundle + ' })') :
 	// un fichier CommonJS (require / module.exports) ou un commentaire AVANT
 	// l'expression fait retourner undefined au loader, et start() n'est jamais appele.
 	// (bug des versions <= 1.3.0)
 	//
-	// v1.5.0 - ameliorations :
+	// v1.5.0 :
 	// - zero recalcul dans can() : le retournement VIEW_CHANNEL false->true exploite
 	//   directement ctx.result (le vrai can vient de tourner). CONNECT et
 	//   SEND_MESSAGES ne sont jamais modifies.
 	// - cache de permissions par id de salon, rempli passivement par can() et
-	//   invalide via un patch before sur Dispatcher.dispatch (GUILD_ROLE_UPDATE,
-	//   CHANNEL_UPDATE, CONNECTION_OPEN, ...).
+	//   invalide via un patch before sur Dispatcher.dispatch.
 	// - filtres par type de salon : showText, showVoice, showStage, showForum,
 	//   showDirectory (+ markHidden, blockUnreads, safety), persistes via storage.
 	// - fetchMessages ET jumpToMessage bloques pour les salons reellement restreints.
-	// - garde anti double-start, patches proteges (okPatch), toast de diagnostic
-	//   (nombre de patches + modules manquants), handle unbound.__showHiddenChannels.
+	// - garde anti double-start, patches proteges (okPatch), toast de diagnostic,
+	//   handle unbound.__showHiddenChannels.
+	//
+	// v1.6.0 :
+	// - garde vocal : joinVoiceChannel et selectVoiceChannel bloques pour les
+	//   salons restreints (toast explicatif) au lieu d'une erreur serveur 403.
+	// - garde acknowledge (marquer comme lu) bloquee pour les salons restreints.
+	// - invalidation du cache etendue : GUILD_ROLE_DELETE, GUILD_DELETE, THREAD_*,
+	//   GUILD_MEMBER_ROLES_UPDATE, etc.
+	// - diagnostics a deux niveaux : manques CRITIQUES seulement dans le toast
+	//   (can, canWithPartialContext, dispatch), manques optionnels uniquement
+	//   dans dump().optionalMissing (pas d'alerte inutile).
+	// - setSetting confirme par un toast + getSetting(nom) dans le handle.
 
-	var VERSION = '1.5.0';
+	var VERSION = '1.6.0';
 	var STORE_KEY = 'show-hidden-channels';
 	var SETTINGS_KEY = 'settings';
 
@@ -67,7 +77,8 @@
 		addedIsHidden: null,
 		permCache: {},
 		settings: {},
-		missing: []
+		missing: [],
+		optionalMissing: []
 	};
 
 	function toast(content) {
@@ -177,9 +188,18 @@
 			if (typeof value !== 'boolean') return false;
 			state.settings[name] = value;
 			saveSettings();
+			toast('Reglage ' + name + ' = ' + value);
 			return true;
 		} catch (_) {
 			return false;
+		}
+	}
+
+	function getSetting(name) {
+		try {
+			return (name in state.settings) ? state.settings[name] : undefined;
+		} catch (_) {
+			return undefined;
 		}
 	}
 
@@ -246,6 +266,15 @@
 			function () { return metro.findByProps && metro.findByProps('fetchMessages', 'sendMessage'); }
 		]);
 
+		var VoiceModule = firstResult([
+			function () { return metro.findByProps && metro.findByProps('joinVoiceChannel'); },
+			function () { return metro.findByProps && metro.findByProps('selectVoiceChannel'); }
+		]);
+
+		var AckModule = firstResult([
+			function () { return metro.findByProps && metro.findByProps('acknowledge'); }
+		]);
+
 		var UnreadStore = firstResult([
 			function () { return metro.findByProps && metro.findByProps('isForumPostUnread'); }
 		]);
@@ -259,6 +288,7 @@
 		loadSettings();
 		state.permCache = {};
 		state.missing = [];
+		state.optionalMissing = [];
 
 		// Reference au VRAI can(), capturee avant le patch : elle reste non-patchee
 		// et sert de fallback quand le cache de permissions est froid.
@@ -295,7 +325,9 @@
 			return null;
 		}
 
-		function okPatch(label, factory) {
+		// okPatch : patches proteges. optional=true : echec silencieux (compte
+		// seulement dans dump().optionalMissing), sinon manque critique dans le toast.
+		function okPatch(label, factory, optional) {
 			try {
 				var unpatch = factory();
 				if (typeof unpatch === 'function') {
@@ -303,7 +335,11 @@
 					return true;
 				}
 			} catch (_) {}
-			state.missing.push(label);
+			if (optional) {
+				state.optionalMissing.push(label);
+			} else {
+				state.missing.push(label);
+			}
 			return false;
 		}
 
@@ -352,13 +388,19 @@
 		// 3) Invalidation automatique du cache de permissions.
 		var INVALIDATE = {
 			GUILD_ROLE_UPDATE: 1,
+			GUILD_ROLE_DELETE: 1,
 			GUILD_MEMBER_UPDATE: 1,
+			GUILD_MEMBER_ROLES_UPDATE: 1,
 			CHANNEL_UPDATE: 1,
 			CHANNEL_CREATE: 1,
 			CHANNEL_DELETE: 1,
 			CHANNEL_OVERWRITE_CREATE: 1,
 			CHANNEL_OVERWRITE_UPDATE: 1,
 			CHANNEL_OVERWRITE_DELETE: 1,
+			THREAD_CREATE: 1,
+			THREAD_UPDATE: 1,
+			THREAD_DELETE: 1,
+			GUILD_DELETE: 1,
 			CONNECTION_OPEN: 1,
 			USER_GUILD_SETTINGS_UPDATE: 1
 		};
@@ -394,8 +436,9 @@
 			}
 		} catch (_) {}
 
-		// 5) Securite : jamais charger les messages d'un salon reellement cache
-		//    (fetchMessages ET jumpToMessage, les deux signatures d'arguments).
+		// 5) Securite : jamais solliciter un salon reellement cache. Les gardes ne
+		//    bloquent QUE si l'argument resout vers un salon restreint connu du
+		//    ChannelStore (sans effet de bord sur les autres appels).
 		function extractChannelId(args) {
 			try {
 				if (!args || !args.length) return null;
@@ -412,7 +455,7 @@
 			}
 		}
 
-		function guardAction(label, obj, method) {
+		function guardAction(label, obj, method, onBlock) {
 			okPatch(label, function () {
 				if (!obj || typeof obj[method] !== 'function') return null;
 				return Patcher.instead(obj, method, function (ctx) {
@@ -421,15 +464,27 @@
 						var cid = extractChannelId(ctx.args);
 						if (cid != null && ChannelStore && typeof ChannelStore.getChannel === 'function') {
 							var channel = ChannelStore.getChannel(cid);
-							if (channel && isRestrictedCached(channel)) return null;
+							if (channel && isRestrictedCached(channel)) {
+								if (typeof onBlock === 'function') {
+									try { onBlock(channel); } catch (_) {}
+								}
+								return null;
+							}
 						}
 					} catch (_) {}
 					return ctx.original.apply(ctx.this, ctx.args);
 				});
-			});
+			}, true);
 		}
 		guardAction('MessageActions.fetchMessages', MessageActions, 'fetchMessages');
 		guardAction('MessageActions.jumpToMessage', MessageActions, 'jumpToMessage');
+		guardAction('VoiceModule.joinVoiceChannel', VoiceModule, 'joinVoiceChannel', function () {
+			toast('Salon vocal restreint : connexion bloquee');
+		});
+		guardAction('VoiceModule.selectVoiceChannel', VoiceModule, 'selectVoiceChannel', function () {
+			toast('Salon vocal restreint : connexion bloquee');
+		});
+		guardAction('AckModule.acknowledge', AckModule, 'acknowledge');
 
 		// 6) UnreadStore : aucun badge de non-lu sur les salons reellement caches.
 		var unreadMethods = ['getGuildChannelUnreadState', 'getMentionCount', 'getUnreadCount'];
@@ -454,7 +509,7 @@
 						} catch (_) {}
 						return ctx.result;
 					});
-				});
+				}, true);
 			})(unreadMethods[i]);
 		}
 
@@ -465,6 +520,7 @@
 
 		var handle = {
 			setSetting: setSetting,
+			getSetting: getSetting,
 			getSettings: function () { return state.settings; },
 			getHiddenChannelIds: function () {
 				var out = [];
@@ -479,6 +535,7 @@
 					version: VERSION,
 					patchCount: state.patches.length,
 					missing: state.missing.slice(),
+					optionalMissing: state.optionalMissing.slice(),
 					settings: state.settings,
 					hiddenIds: handle.getHiddenChannelIds()
 				};
@@ -509,6 +566,7 @@
 
 		state.permCache = {};
 		state.missing = [];
+		state.optionalMissing = [];
 		state.started = false;
 
 		try { if (api) delete api.__showHiddenChannels; } catch (_) {}
